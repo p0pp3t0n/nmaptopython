@@ -15,23 +15,31 @@ echo "[*] Querying MSSQL on $TARGET_IP:$TARGET_PORT via raw TDS handshake..."
 # Craft raw hex TDS PRELOGIN packet
 PRELOGIN_HEX="1201003200000000000015000601001b000102001c000c0300280004ff0b0002320000020000000000000000000000000000"
 
-# Send packet and get response in hex format
-RESPONSE_HEX=$(echo -n -e "$(echo "$PRELOGIN_HEX" | sed 's/\(..\)/\\x\1/g')" | nc -w 3 "$TARGET_IP" "$TARGET_PORT" | xxd -p | tr -d '\n')
+# Convert hex payload to raw bytes
+RAW_PAYLOAD=$(echo -n -e "$(echo "$PRELOGIN_HEX" | sed 's/\(..\)/\\x\1/g')")
+
+# Try sending with nc -N (OpenBSD netcat standard on Kali)
+RESPONSE_HEX=$(echo -n "$RAW_PAYLOAD" | nc -N -w 3 "$TARGET_IP" "$TARGET_PORT" 2>/dev/null | xxd -p | tr -d '\n')
+
+# Fallback to nc -q 2 if -N fails or returns nothing (Traditional netcat)
+if [ -z "$RESPONSE_HEX" ]; then
+    RESPONSE_HEX=$(echo -n "$RAW_PAYLOAD" | nc -q 2 -w 3 "$TARGET_IP" "$TARGET_PORT" 2>/dev/null | xxd -p | tr -d '\n')
+fi
 
 # Check if we got a response
 if [ -z "$RESPONSE_HEX" ]; then
     echo "[-] Error: No response received from $TARGET_IP:$TARGET_PORT"
+    echo "[-] Ensure no firewalls are dropping the payload packet."
     exit 1
 fi
 
 # Find the 'ff' delimiter that precedes the version payload
-# MSSQL PRELOGIN token option for version starts with option token 0x00.
-# The version data length is 6 bytes.
-# We look for 'ff' which terminates the option offsets list.
 if [[ "$RESPONSE_HEX" =~ ff([0-9a-f]{12}) ]]; then
+    # BASH_REMATCH[1] contains just the 12 hex characters after 'ff'
     VERSION_BYTES="${BASH_REMATCH[1]}"
 else
     echo "[-] Error: Could not find version block token in server response."
+    echo "[-] Raw Response Hex: $RESPONSE_HEX"
     exit 1
 fi
 
