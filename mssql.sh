@@ -12,18 +12,15 @@ TARGET_PORT="${2:-1433}"
 
 echo "[*] Querying MSSQL on $TARGET_IP:$TARGET_PORT via raw TDS handshake..."
 
-# Craft raw hex TDS PRELOGIN packet
+# Fixed: Keep the payload strictly as a hex string to avoid Bash null-byte corruption
 PRELOGIN_HEX="1201003200000000000015000601001b000102001c000c0300280004ff0b0002320000020000000000000000000000000000"
 
-# Convert hex payload to raw bytes
-RAW_PAYLOAD=$(echo -n -e "$(echo "$PRELOGIN_HEX" | sed 's/\(..\)/\\x\1/g')")
+# Convert and pipe directly to Netcat in one stream
+RESPONSE_HEX=$(echo "$PRELOGIN_HEX" | xxd -r -p | nc -N -w 3 "$TARGET_IP" "$TARGET_PORT" 2>/dev/null | xxd -p | tr -d '\n')
 
-# Try sending with nc -N (OpenBSD netcat standard on Kali)
-RESPONSE_HEX=$(echo -n "$RAW_PAYLOAD" | nc -N -w 3 "$TARGET_IP" "$TARGET_PORT" 2>/dev/null | xxd -p | tr -d '\n')
-
-# Fallback to nc -q 2 if -N fails or returns nothing (Traditional netcat)
+# Fallback for older Netcat versions (-q 2 instead of -N)
 if [ -z "$RESPONSE_HEX" ]; then
-    RESPONSE_HEX=$(echo -n "$RAW_PAYLOAD" | nc -q 2 -w 3 "$TARGET_IP" "$TARGET_PORT" 2>/dev/null | xxd -p | tr -d '\n')
+    RESPONSE_HEX=$(echo "$PRELOGIN_HEX" | xxd -r -p | nc -q 2 -w 3 "$TARGET_IP" "$TARGET_PORT" 2>/dev/null | xxd -p | tr -d '\n')
 fi
 
 # Check if we got a response
@@ -35,7 +32,7 @@ fi
 
 # Find the 'ff' delimiter that precedes the version payload
 if [[ "$RESPONSE_HEX" =~ ff([0-9a-f]{12}) ]]; then
-    # BASH_REMATCH[1] contains just the 12 hex characters after 'ff'
+    # Strip everything except the 12 hex digits following 'ff'
     VERSION_BYTES="${BASH_REMATCH[1]}"
 else
     echo "[-] Error: Could not find version block token in server response."
