@@ -570,30 +570,55 @@ TOOLS_BRUTE=(
     "psql:PostgreSQL client for default login test"
 )
 
+# Tool name → Kali apt package name
+declare -A APT_PKG=(
+    [nmap]="nmap"
+    [curl]="curl"
+    [nc]="netcat-openbsd"
+    [netexec]="netexec"
+    [sslscan]="sslscan"
+    [openssl]="openssl"
+    [whatweb]="whatweb"
+    [wafw00f]="wafw00f"
+    [ssh-audit]="ssh-audit"
+    [dig]="dnsutils"
+    [ldapsearch]="ldap-utils"
+    [showmount]="nfs-common"
+    [rpcinfo]="rpcbind"
+    [nbtscan]="nbtscan"
+    [onesixtyone]="onesixtyone"
+    [snmpwalk]="snmp"
+    [snmp-check]="snmpcheck"
+    [ipmitool]="ipmitool"
+    [redis-cli]="redis-tools"
+    [mongosh]="mongosh"
+    [nikto]="nikto"
+    [nuclei]="nuclei"
+    [feroxbuster]="feroxbuster"
+    [testssl.sh]="testssl.sh"
+    [enum4linux-ng]="enum4linux"
+    [dnsrecon]="dnsrecon"
+    [odat]="odat"
+    [hydra]="hydra"
+    [smtp-user-enum]="smtp-user-enum"
+    [mysql]="default-mysql-client"
+    [psql]="postgresql-client"
+)
+
 check_tools() {
     local missing=0 total=0 found=0
+    local missing_pkgs=()
+    local missing_manual=()
 
     echo ""
     echo -e "${BOLD}=== Tool Check ===${NC}"
     echo ""
 
-    echo -e "${BOLD}Core tools (quick mode):${NC}"
-    for entry in "${TOOLS_CORE[@]}"; do
-        local tool="${entry%%:*}" desc="${entry#*:}"
-        total=$((total + 1))
-        if command -v "$tool" &>/dev/null; then
-            ok "$tool — $desc"
-            found=$((found + 1))
-        else
-            err "$tool — $desc"
-            missing=$((missing + 1))
-        fi
-    done
-
-    if [[ $DEEP -eq 1 ]]; then
-        echo ""
-        echo -e "${BOLD}Deep mode tools (-D):${NC}"
-        for entry in "${TOOLS_DEEP[@]}"; do
+    _check_list() {
+        local label="$1"; shift
+        local entries=("$@")
+        echo -e "${BOLD}${label}:${NC}"
+        for entry in "${entries[@]}"; do
             local tool="${entry%%:*}" desc="${entry#*:}"
             total=$((total + 1))
             if command -v "$tool" &>/dev/null; then
@@ -602,24 +627,27 @@ check_tools() {
             else
                 err "$tool — $desc"
                 missing=$((missing + 1))
+                if [[ "$tool" == "kerbrute" ]]; then
+                    missing_manual+=("kerbrute — https://github.com/ropnop/kerbrute/releases")
+                elif [[ -n "${APT_PKG[$tool]:-}" ]]; then
+                    missing_pkgs+=("${APT_PKG[$tool]}")
+                else
+                    missing_manual+=("$tool")
+                fi
             fi
         done
+    }
+
+    _check_list "Core tools (quick mode)" "${TOOLS_CORE[@]}"
+
+    if [[ $DEEP -eq 1 ]]; then
+        echo ""
+        _check_list "Deep mode tools (-D)" "${TOOLS_DEEP[@]}"
     fi
 
     if [[ $BRUTE -eq 1 ]]; then
         echo ""
-        echo -e "${BOLD}Brute mode tools (-B):${NC}"
-        for entry in "${TOOLS_BRUTE[@]}"; do
-            local tool="${entry%%:*}" desc="${entry#*:}"
-            total=$((total + 1))
-            if command -v "$tool" &>/dev/null; then
-                ok "$tool — $desc"
-                found=$((found + 1))
-            else
-                err "$tool — $desc"
-                missing=$((missing + 1))
-            fi
-        done
+        _check_list "Brute mode tools (-B)" "${TOOLS_BRUTE[@]}"
     fi
 
     echo ""
@@ -627,14 +655,18 @@ check_tools() {
         ok "All $total tools installed"
     else
         warn "$found/$total tools installed, $missing missing"
-        echo ""
-        log "On Kali: sudo apt install <package>"
-        log "Most tools are pre-installed on Kali. For others:"
-        log "  nuclei: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-        log "  feroxbuster: sudo apt install feroxbuster"
-        log "  kerbrute: go install github.com/ropnop/kerbrute@latest"
-        log "  odat: pip install odat"
-        log "  mongosh: https://www.mongodb.com/try/download/shell"
+        if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+            echo ""
+            log "Install missing tools:"
+            log "  sudo apt install ${missing_pkgs[*]}"
+        fi
+        if [[ ${#missing_manual[@]} -gt 0 ]]; then
+            echo ""
+            log "Manual install:"
+            for item in "${missing_manual[@]}"; do
+                log "  $item"
+            done
+        fi
     fi
 
     return $missing
