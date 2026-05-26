@@ -724,33 +724,40 @@ LOG_FILE="$OUTDIR/infra-recon.log"
 # Emit lines: HOST|HOSTNAME|PORT|PROTO|SERVICE|PRODUCT|VERSION
 parse_nmap() {
     awk '
+    function xmlattr(line, attr,    s, e) {
+        s = index(line, attr "=\"")
+        if (s == 0) return ""
+        s += length(attr) + 2
+        e = index(substr(line, s), "\"")
+        if (e == 0) return ""
+        return substr(line, s, e - 1)
+    }
+
     /<host[> ]/ { in_host=1; addr=""; hostname=""; host_up=0 }
     /<\/host>/ { in_host=0 }
 
     in_host && /status.*state="up"/ { host_up=1 }
 
     in_host && /address.*addrtype="ipv4"/ {
-        match($0, /addr="([^"]*)"/, m)
-        addr = m[1]
+        addr = xmlattr($0, "addr")
     }
 
     in_host && /<hostname / {
-        match($0, /name="([^"]*)"/, m)
-        hostname = m[1]
+        hostname = xmlattr($0, "name")
     }
 
     in_host && host_up && /<port / {
-        match($0, /protocol="([^"]*)"/, m); proto = m[1]
-        match($0, /portid="([^"]*)"/, m); portid = m[1]
+        proto = xmlattr($0, "protocol")
+        portid = xmlattr($0, "portid")
         port_open = 0; svc_name = ""; svc_product = ""; svc_version = ""
     }
 
     in_host && /state="open"/ { port_open = 1 }
 
     in_host && /<service / {
-        if (match($0, /name="([^"]*)"/, m)) svc_name = m[1]
-        if (match($0, /product="([^"]*)"/, m)) svc_product = m[1]
-        if (match($0, /version="([^"]*)"/, m)) svc_version = m[1]
+        svc_name = xmlattr($0, "name")
+        svc_product = xmlattr($0, "product")
+        svc_version = xmlattr($0, "version")
     }
 
     in_host && /<\/port>/ {
@@ -761,8 +768,9 @@ parse_nmap() {
     ' "$1"
 }
 
-declare -A HOST_PORTS  # host -> "port:service ..."
-declare -A HOST_NAMES  # host -> hostname
+declare -A HOST_PORTS=()  # host -> "port:service ..."
+declare -A HOST_NAMES=()  # host -> hostname
+HOST_COUNT=0
 
 while IFS='|' read -r addr hostname port proto svc product version; do
     [[ -z "$addr" || -z "$port" ]] && continue
@@ -777,9 +785,10 @@ while IFS='|' read -r addr hostname port proto svc product version; do
 
     HOST_PORTS["$addr"]+="$port:$svc:$product:$version "
     [[ -n "$hostname" ]] && HOST_NAMES["$addr"]="$hostname"
+    HOST_COUNT=1
 done < <(parse_nmap "$NMAP_FILE")
 
-if [[ ${#HOST_PORTS[@]} -eq 0 ]]; then
+if [[ $HOST_COUNT -eq 0 ]]; then
     err "No hosts with open ports found (after filters)."
     exit 1
 fi
