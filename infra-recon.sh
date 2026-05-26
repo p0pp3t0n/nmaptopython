@@ -34,14 +34,18 @@ usage() {
     cat <<'EOF'
 Usage: infra-recon.sh -n <nmap.xml> [-o output_dir] [options]
        infra-recon.sh -C [-D] [-B]
+       infra-recon.sh -S <output_dir>
+       infra-recon.sh -K <PID> <output_dir>
 
-Required (unless -C):
+Required (unless -C, -S, or -K):
   -n FILE       Nmap XML (-oX) file
 
 Modes:
   -C            Tool check — list all tools and their install status, then exit
   -D            Deep mode — slow tools: nikto, nuclei, feroxbuster, testssl, enum4linux-ng
   -B            Brute mode — default-credential checks (hydra, netexec)
+  -S DIR        Status — show running tasks with elapsed time
+  -K PID        Kill a running task by PID (requires -S DIR too)
 
 Options:
   -o DIR        Output directory (default: recon_YYYYMMDD_HHMMSS)
@@ -49,7 +53,7 @@ Options:
   -H HOSTS      Comma-separated host filter
   -P PORTS      Comma-separated port filter
   -t SECS       Per-command timeout (default: 300)
-  -T NUM        Max parallel tasks per host (default: 5)
+  -T NUM        Max parallel tasks (default: 5)
 
 Examples:
   infra-recon.sh -C                              # check tools
@@ -57,8 +61,79 @@ Examples:
   infra-recon.sh -n full_tcp.xml -o ./recon
   infra-recon.sh -n full_tcp.xml -o ./recon -D -B -d corp.local
   infra-recon.sh -n full_tcp.xml -o ./recon -P 80,443,445 -H 10.0.0.5
+
+  # In another terminal while a scan is running:
+  infra-recon.sh -S ./recon                      # show running tasks
+  infra-recon.sh -K 12345 -S ./recon             # kill task with PID 12345
 EOF
     exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Status / kill modes — run from a second terminal
+# ---------------------------------------------------------------------------
+show_status() {
+    local taskdir="$1/.tasks"
+    if [[ ! -d "$taskdir" ]]; then
+        err "No active scan found in $1 (missing .tasks/)"
+        exit 1
+    fi
+
+    local now count=0
+    now=$(date +%s)
+
+    echo ""
+    echo -e "${BOLD}=== Running Tasks ===${NC}"
+    echo ""
+
+    for f in "$taskdir"/*; do
+        [[ -f "$f" ]] || continue
+        local pid start_epoch host port svc name cmd
+        pid=$(basename "$f")
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$f"
+            continue
+        fi
+
+        IFS='|' read -r start_epoch host port svc name cmd < "$f"
+        local elapsed=$(( now - start_epoch ))
+        local mins=$(( elapsed / 60 ))
+        local secs=$(( elapsed % 60 ))
+        local time_str="${mins}m${secs}s"
+
+        echo -e "  ${BOLD}PID${NC} $pid  ${BOLD}TIME${NC} $time_str  ${BOLD}TARGET${NC} ${host}:${port}/${svc}  ${BOLD}TASK${NC} $name"
+        echo -e "  ${BOLD}CMD${NC} $cmd"
+        echo -e "  ${BOLD}OUT${NC} $1/${host}/${port}_${svc}/${name}.txt"
+        echo -e "  ${BOLD}KILL${NC} $0 -K $pid -S $1"
+        echo ""
+        count=$((count + 1))
+    done
+
+    if [[ $count -eq 0 ]]; then
+        log "No tasks currently running."
+    else
+        log "$count task(s) running"
+    fi
+}
+
+kill_task() {
+    local pid="$1" taskdir="$2/.tasks"
+    local taskfile="$taskdir/$pid"
+
+    if [[ ! -f "$taskfile" ]]; then
+        err "PID $pid not found in active tasks"
+        show_status "$2"
+        exit 1
+    fi
+
+    local start_epoch host port svc name cmd
+    IFS='|' read -r start_epoch host port svc name cmd < "$taskfile"
+
+    log "Killing task: ${host}:${port}/${svc} — ${name} (PID $pid)"
+    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+    rm -f "$taskfile"
+    ok "Killed PID $pid"
 }
 
 # ---------------------------------------------------------------------------
@@ -556,7 +631,7 @@ TOOLS_DEEP=(
     "nikto:web vulnerability scanner"
     "nuclei:template-based vuln scanner"
     "feroxbuster:directory brute-force"
-    "testssl.sh:thorough SSL/TLS analysis"
+    "testssl:thorough SSL/TLS analysis"
     "enum4linux-ng:SMB/RPC full enumeration"
     "dnsrecon:DNS enumeration and brute-force"
     "kerbrute:Kerberos user enumeration"
@@ -595,7 +670,7 @@ declare -A APT_PKG=(
     [nikto]="nikto"
     [nuclei]="nuclei"
     [feroxbuster]="feroxbuster"
-    [testssl.sh]="testssl.sh"
+    [testssl]="testssl"
     [enum4linux-ng]="enum4linux"
     [dnsrecon]="dnsrecon"
     [odat]="odat"
@@ -676,9 +751,9 @@ check_tools() {
 # Defaults
 # ---------------------------------------------------------------------------
 NMAP_FILE="" OUTDIR="" DEEP=0 BRUTE=0 DOMAIN="" HOST_FILTER="" PORT_FILTER=""
-CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0
+CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0 STATUS_DIR="" KILL_PID=""
 
-while getopts "n:o:DBCd:H:P:t:T:h" opt; do
+while getopts "n:o:DBCd:H:P:t:T:S:K:h" opt; do
     case $opt in
         n) NMAP_FILE="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
@@ -690,9 +765,24 @@ while getopts "n:o:DBCd:H:P:t:T:h" opt; do
         P) PORT_FILTER="$OPTARG" ;;
         t) CMD_TIMEOUT="$OPTARG" ;;
         T) MAX_PARALLEL="$OPTARG" ;;
+        S) STATUS_DIR="$OPTARG" ;;
+        K) KILL_PID="$OPTARG" ;;
         h|*) usage ;;
     esac
 done
+
+# Kill mode
+if [[ -n "$KILL_PID" ]]; then
+    [[ -z "$STATUS_DIR" ]] && { err "-K requires -S <output_dir>"; exit 1; }
+    kill_task "$KILL_PID" "$STATUS_DIR"
+    exit $?
+fi
+
+# Status mode
+if [[ -n "$STATUS_DIR" ]]; then
+    show_status "$STATUS_DIR"
+    exit $?
+fi
 
 # Tool check mode
 if [[ $CHECK_ONLY -eq 1 ]]; then
@@ -871,6 +961,8 @@ classify_port() {
 # ---------------------------------------------------------------------------
 RESULTS_LOG="$OUTDIR/results.csv"
 echo "STATUS|HOST|PORT|SERVICE|TASK|SUMMARY" > "$RESULTS_LOG"
+TASKS_DIR="$OUTDIR/.tasks"
+mkdir -p "$TASKS_DIR"
 PARALLEL_PIDS=()
 
 has_tool() { command -v "$1" &>/dev/null; }
@@ -880,6 +972,13 @@ run_task() {
     shift 5
     local cmd="$*"
     local tool="${cmd%% *}"
+    local taskfile="$TASKS_DIR/$$"
+
+    # Register this task
+    echo "$(date +%s)|${host}|${port}|${svc}|${name}|${cmd}" > "$taskfile"
+
+    _cleanup_task() { rm -f "$taskfile"; }
+    trap '_cleanup_task' RETURN
 
     if ! has_tool "$tool"; then
         echo "# [SKIP] tool not found: $tool" > "$outfile"
@@ -1060,7 +1159,7 @@ recon_http() {
             "echo | openssl s_client -connect ${host}:${port} 2>/dev/null | openssl x509 -noout -text 2>/dev/null"
         if [[ $DEEP -eq 1 ]]; then
             run_bg "$host" "$port" https testssl "$d/testssl.txt" \
-                "testssl.sh --quiet --color 0 ${host}:${port}"
+                "testssl --quiet --color 0 ${host}:${port}"
         fi
     fi
 
@@ -1425,8 +1524,9 @@ log "Nmap input: $NMAP_FILE"
 log "Output:     $OUTDIR"
 log "Mode:       $mode_label"
 log "Timeout:    ${CMD_TIMEOUT}s per command"
-log "Parallel:   $MAX_PARALLEL tasks per host"
+log "Parallel:   $MAX_PARALLEL tasks"
 [[ -n "$DOMAIN" ]] && log "Domain:     $DOMAIN"
+log "Status:     $0 -S $OUTDIR"
 echo ""
 
 total_ports=0
@@ -1483,15 +1583,18 @@ for host in $(echo "${!HOST_PORTS[@]}" | tr ' ' '\n' | sort); do
 
         dispatch_service "$svc_key" "$host" "$port" "$svc_dir"
     done
-
-    wait_all
-    echo ""
 done
+
+log "All tasks dispatched, waiting for completion..."
+wait_all
+echo ""
 
 report_path=$(generate_report)
 ok_count=$(grep -c '^OK|' "$RESULTS_LOG" 2>/dev/null || echo "0")
 fail_count=$(grep -c '^FAIL|' "$RESULTS_LOG" 2>/dev/null || echo "0")
 skip_count=$(grep -c '^SKIP|' "$RESULTS_LOG" 2>/dev/null || echo "0")
+
+rm -rf "$TASKS_DIR"
 
 echo -e "${BOLD}=== Done ===${NC}"
 ok "Tasks: $ok_count succeeded, $fail_count failed, $skip_count skipped (missing tools)"
