@@ -1115,9 +1115,9 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
 
     # If we have results, pull stats (merge across all result files)
     if [[ $HAS_RESULTS -eq 1 ]]; then
-        nar_ok=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^OK|' 2>/dev/null || echo "0")
-        nar_fail=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^FAIL|' 2>/dev/null || echo "0")
-        nar_skip=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^SKIP|' 2>/dev/null || echo "0")
+        nar_ok=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^OK|' || true)
+        nar_fail=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^FAIL|' || true)
+        nar_skip=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^SKIP|' || true)
         nar_total=$((nar_ok + nar_fail + nar_skip))
         nar_missing=$(cat "${NAR_RESULT_FILES[@]}" | grep '^SKIP|' | sed 's/.*tool not found: //' | sort -u | paste -sd',' | sed 's/,/, /g' || true)
         nar_interesting=$(cat "${NAR_RESULT_FILES[@]}" | grep '^OK|' | grep -iE 'anonymous|vulnerable|open relay|no auth|PONG|cipher.0|no_root_squash|Pwn3d|guest|null session|signing not required|listdatabases|200 \.env|200 \.git' || true)
