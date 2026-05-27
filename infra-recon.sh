@@ -43,6 +43,7 @@ Required (unless -C, -S, or -K):
 Modes:
   -C            Tool check — list all tools and their install status, then exit
   -L            List — print a host/port summary table and exit (no recon)
+  -N            Narrative — generate a testing narrative for reporting and exit
   -D            Deep mode — slow tools: nikto, nuclei, feroxbuster, testssl, enum4linux-ng
   -B            Brute mode — default-credential checks (hydra, netexec)
   -S DIR        Status — show running tasks with elapsed time
@@ -61,6 +62,8 @@ Examples:
   infra-recon.sh -C -D -B                        # check all tools including deep + brute
   infra-recon.sh -n full_tcp.xml -L              # just list hosts and open ports
   infra-recon.sh -n full_tcp.xml -L -H 10.0.0.5  # list, filtered to one host
+  infra-recon.sh -n full_tcp.xml -N              # generate testing narrative
+  infra-recon.sh -n full_tcp.xml -N -D -B        # narrative reflecting deep+brute
   infra-recon.sh -n full_tcp.xml -o ./recon
   infra-recon.sh -n full_tcp.xml -o ./recon -D -B -d corp.local
   infra-recon.sh -n full_tcp.xml -o ./recon -P 80,443,445 -H 10.0.0.5
@@ -754,9 +757,9 @@ check_tools() {
 # Defaults
 # ---------------------------------------------------------------------------
 NMAP_FILE="" OUTDIR="" DEEP=0 BRUTE=0 DOMAIN="" HOST_FILTER="" PORT_FILTER=""
-CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0 LIST_ONLY=0 STATUS_DIR="" KILL_PID=""
+CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0 LIST_ONLY=0 NARRATIVE_ONLY=0 STATUS_DIR="" KILL_PID=""
 
-while getopts "n:o:DBCLd:H:P:t:T:S:K:h" opt; do
+while getopts "n:o:DBCLNd:H:P:t:T:S:K:h" opt; do
     case $opt in
         n) NMAP_FILE="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
@@ -764,6 +767,7 @@ while getopts "n:o:DBCLd:H:P:t:T:S:K:h" opt; do
         B) BRUTE=1 ;;
         C) CHECK_ONLY=1 ;;
         L) LIST_ONLY=1 ;;
+        N) NARRATIVE_ONLY=1 ;;
         d) DOMAIN="$OPTARG" ;;
         H) HOST_FILTER="$OPTARG" ;;
         P) PORT_FILTER="$OPTARG" ;;
@@ -797,15 +801,15 @@ fi
 [[ -z "$NMAP_FILE" ]] && usage
 [[ ! -f "$NMAP_FILE" ]] && { err "File not found: $NMAP_FILE"; exit 1; }
 
-# List mode (-L) skips output dir, wordlists, and recon — just parse and print
-if [[ $LIST_ONLY -eq 0 ]]; then
+# List/narrative modes skip creating output dir and extracting wordlists
+if [[ $LIST_ONLY -eq 0 && $NARRATIVE_ONLY -eq 0 ]]; then
     [[ -z "$OUTDIR" ]] && OUTDIR="recon_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$OUTDIR"
     extract_wordlists
 fi
 
-# Initialize log file (skip in list-only mode)
-if [[ $LIST_ONLY -eq 0 ]]; then
+# Initialize log file (skip in list/narrative mode)
+if [[ $LIST_ONLY -eq 0 && $NARRATIVE_ONLY -eq 0 ]]; then
     LOG_FILE="$OUTDIR/infra-recon.log"
     {
         echo "================================================================"
@@ -911,7 +915,7 @@ if [[ ${#HOSTS_UP[@]} -eq 0 ]]; then
     exit 1
 fi
 
-if [[ $HOST_COUNT -eq 0 && $LIST_ONLY -eq 0 ]]; then
+if [[ $HOST_COUNT -eq 0 && $LIST_ONLY -eq 0 && $NARRATIVE_ONLY -eq 0 ]]; then
     err "No open ports found across ${#HOSTS_UP[@]} live host(s) — nothing to recon."
     err "Use -L to see the host list anyway."
     exit 1
@@ -1044,6 +1048,222 @@ classify_port() {
             ;;
     esac
 }
+
+# ---------------------------------------------------------------------------
+# Narrative mode — generate testing narrative for reports and exit
+# ---------------------------------------------------------------------------
+if [[ $NARRATIVE_ONLY -eq 1 ]]; then
+    # Check if we have results from a completed run
+    HAS_RESULTS=0
+    if [[ -n "${OUTDIR:-}" && -f "$OUTDIR/results.csv" ]]; then
+        HAS_RESULTS=1
+        NAR_RESULTS="$OUTDIR/results.csv"
+    fi
+
+    # Collect unique service categories across all hosts
+    declare -A NAR_SVCS=()      # svc_key -> 1
+    declare -A NAR_SVC_HOSTS=() # svc_key -> count of hosts with that service
+    declare -A NAR_SVC_PORTS=() # svc_key -> "port1, port2, ..."
+    for host in "${!HOST_PORTS[@]}"; do
+        declare -A _host_svcs=()
+        while IFS="$FS" read -r _p _s _prod _ver; do
+            [[ -z "$_p" ]] && continue
+            local_key=$(classify_port "$_p" "$_s")
+            [[ -z "$local_key" ]] && continue
+            NAR_SVCS["$local_key"]=1
+            if [[ -z "${_host_svcs[$local_key]:-}" ]]; then
+                NAR_SVC_HOSTS["$local_key"]=$(( ${NAR_SVC_HOSTS["$local_key"]:-0} + 1 ))
+                _host_svcs["$local_key"]=1
+            fi
+            if [[ -z "${NAR_SVC_PORTS[$local_key]:-}" ]]; then
+                NAR_SVC_PORTS["$local_key"]="$_p"
+            elif ! echo ",${NAR_SVC_PORTS[$local_key]}," | grep -q ",$_p,"; then
+                NAR_SVC_PORTS["$local_key"]="${NAR_SVC_PORTS[$local_key]}, $_p"
+            fi
+        done < <(echo "${HOST_PORTS[$host]}" | tr "$RS" '\n')
+        unset _host_svcs
+    done
+
+    total_open=0
+    for host in "${!HOST_PORTS[@]}"; do
+        count=$(echo "${HOST_PORTS[$host]}" | tr -cd "$RS" | wc -c)
+        total_open=$((total_open + count))
+    done
+
+    host_count=${#HOSTS_UP[@]}
+    hosts_with=${#HOST_PORTS[@]}
+
+    mode_desc="standard"
+    [[ $DEEP -eq 1 ]] && mode_desc="deep"
+    [[ $BRUTE -eq 1 ]] && mode_desc="$mode_desc with default-credential testing"
+
+    # If we have results, pull stats
+    if [[ $HAS_RESULTS -eq 1 ]]; then
+        nar_ok=$(grep -c '^OK|' "$NAR_RESULTS" 2>/dev/null || echo "0")
+        nar_fail=$(grep -c '^FAIL|' "$NAR_RESULTS" 2>/dev/null || echo "0")
+        nar_skip=$(grep -c '^SKIP|' "$NAR_RESULTS" 2>/dev/null || echo "0")
+        nar_total=$((nar_ok + nar_fail + nar_skip))
+        nar_missing=$(grep '^SKIP|' "$NAR_RESULTS" | sed 's/.*tool not found: //' | sort -u | paste -sd',' | sed 's/,/, /g' || true)
+        nar_interesting=$(grep '^OK|' "$NAR_RESULTS" | grep -iE 'anonymous|vulnerable|open relay|no auth|PONG|cipher.0|no_root_squash|Pwn3d|guest|null session|signing not required|listdatabases|200 \.env|200 \.git' || true)
+    fi
+
+    # --- Build the narrative ---
+    echo ""
+    echo "## Testing Narrative"
+    echo ""
+
+    echo "Active port scanning was performed using Nmap across ${host_count} host(s) in the target environment."
+    if [[ $hosts_with -lt $host_count ]]; then
+        echo "Of these, ${hosts_with} host(s) had open TCP ports (${total_open} open port(s) total); $(( host_count - hosts_with )) host(s) were live but returned no open ports (possibly firewalled or scanned with -Pn)."
+    else
+        echo "All ${host_count} host(s) had open TCP ports, ${total_open} open port(s) total."
+    fi
+    echo ""
+    echo "Automated service-level reconnaissance was conducted in ${mode_desc} mode against each identified service. Testing activities per service category:"
+    echo ""
+
+    # Per-service narrative lines, derived from the actual recon_* functions
+    for svc_key in $(echo "${!NAR_SVCS[@]}" | tr ' ' '\n' | sort); do
+        n="${NAR_SVC_HOSTS[$svc_key]}"
+        ports="${NAR_SVC_PORTS[$svc_key]}"
+        case "$svc_key" in
+            ftp)
+                line="FTP (port ${ports}, ${n} host(s)): Nmap version and script scan, anonymous login testing via NetExec."
+                [[ $BRUTE -eq 1 ]] && line+=" Default credential brute-force with Hydra."
+                ;;
+            ssh)
+                line="SSH (port ${ports}, ${n} host(s)): Version detection, algorithm and configuration audit via ssh-audit."
+                [[ $BRUTE -eq 1 ]] && line+=" Default credential brute-force with Hydra."
+                ;;
+            telnet)
+                line="Telnet (port ${ports}, ${n} host(s)): Nmap version scan, raw banner grab via Netcat."
+                ;;
+            smtp)
+                line="SMTP (port ${ports}, ${n} host(s)): Nmap version and script scan, open relay testing, NTLM info extraction."
+                [[ $BRUTE -eq 1 ]] && line+=" SMTP user enumeration via VRFY."
+                ;;
+            dns)
+                line="DNS (port ${ports}, ${n} host(s)): Version detection, DNS version.bind query."
+                [[ -n "$DOMAIN" ]] && line+=" Zone transfer and reverse DNS enumeration attempted for ${DOMAIN}."
+                [[ $DEEP -eq 1 ]] && line+=" DNS cache snooping and full DNS enumeration via dnsrecon."
+                ;;
+            tftp)
+                line="TFTP (port ${ports}, ${n} host(s)): Nmap TFTP enumeration scan."
+                ;;
+            http)
+                line="HTTP (port ${ports}, ${n} host(s)): Nmap version and script scan, HTTP header inspection, robots.txt and sitemap.xml retrieval, HTTP method enumeration, technology fingerprinting via WhatWeb, WAF detection via wafw00f, sensitive file probing (.env, .git, web.config, phpinfo.php, server-status)."
+                [[ $DEEP -eq 1 ]] && line+=" Deep scanning with Nikto, Nuclei template-based vulnerability scan, and directory brute-force via Feroxbuster."
+                ;;
+            https)
+                line="HTTPS (port ${ports}, ${n} host(s)): Nmap version and script scan, HTTP header inspection, robots.txt and sitemap.xml retrieval, HTTP method enumeration, technology fingerprinting via WhatWeb, WAF detection via wafw00f, sensitive file probing (.env, .git, web.config, phpinfo.php, server-status). SSL/TLS cipher scan via sslscan, certificate inspection via OpenSSL."
+                [[ $DEEP -eq 1 ]] && line+=" Thorough SSL/TLS analysis via testssl, deep scanning with Nikto, Nuclei template-based vulnerability scan, and directory brute-force via Feroxbuster."
+                ;;
+            kerberos)
+                line="Kerberos (port ${ports}, ${n} host(s)): Nmap version detection."
+                [[ -n "$DOMAIN" && $DEEP -eq 1 ]] && line+=" User enumeration via Kerbrute against ${DOMAIN}."
+                ;;
+            pop3)
+                line="POP3 (port ${ports}, ${n} host(s)): Nmap version and script scan."
+                [[ $BRUTE -eq 1 ]] && line+=" Default credential brute-force with Hydra."
+                ;;
+            imap)
+                line="IMAP (port ${ports}, ${n} host(s)): Nmap version and script scan, NTLM info extraction."
+                [[ $BRUTE -eq 1 ]] && line+=" Default credential brute-force with Hydra."
+                ;;
+            rpc)
+                line="RPC (port ${ports}, ${n} host(s)): RPC service listing via rpcinfo, Nmap RPC enumeration."
+                ;;
+            nfs)
+                line="NFS (port ${ports}, ${n} host(s)): Export listing via showmount, Nmap NFS scripts (nfs-ls, nfs-showmount, nfs-statfs) checking for world-readable shares and no_root_squash."
+                ;;
+            smb)
+                line="SMB (port ${ports}, ${n} host(s)): Protocol version enumeration, null session testing (shares, users, groups), guest session testing, SMB signing verification, vulnerability checks for MS17-010 (EternalBlue) and CVE-2020-0796 (SMBGhost)."
+                [[ $DEEP -eq 1 ]] && line+=" Full SMB/RPC enumeration via enum4linux-ng."
+                ;;
+            netbios)
+                line="NetBIOS (port ${ports}, ${n} host(s)): NetBIOS name scan via nbtscan."
+                ;;
+            snmp)
+                line="SNMP (port ${ports}, ${n} host(s)): Community string brute-force via onesixtyone, SNMPv2c walk with 'public' community, SNMP enumeration via snmp-check."
+                ;;
+            ldap)
+                line="LDAP (port ${ports}, ${n} host(s)): Root DSE query via Nmap, anonymous bind testing via ldapsearch."
+                [[ -n "$DOMAIN" && $DEEP -eq 1 ]] && line+=" Anonymous LDAP dump attempted for ${DOMAIN}."
+                ;;
+            ldaps)
+                line="LDAPS (port ${ports}, ${n} host(s)): Root DSE query, anonymous bind testing, certificate inspection via OpenSSL."
+                [[ -n "$DOMAIN" && $DEEP -eq 1 ]] && line+=" Anonymous LDAP dump attempted for ${DOMAIN}."
+                ;;
+            ipmi)
+                line="IPMI (port ${ports}, ${n} host(s)): Nmap IPMI version detection, cipher-zero bypass testing."
+                [[ $BRUTE -eq 1 ]] && line+=" Default credential testing for common BMC vendors (Dell iDRAC, HP iLO, Supermicro)."
+                ;;
+            mssql)
+                line="MSSQL (port ${ports}, ${n} host(s)): Nmap ms-sql-info version detection."
+                [[ $BRUTE -eq 1 ]] && line+=" Default SA credential testing via NetExec."
+                ;;
+            oracle)
+                line="Oracle (port ${ports}, ${n} host(s)): Nmap Oracle TNS version detection."
+                [[ $BRUTE -eq 1 && $DEEP -eq 1 ]] && line+=" SID guessing via ODAT."
+                ;;
+            mysql)
+                line="MySQL (port ${ports}, ${n} host(s)): Nmap mysql-info version detection."
+                [[ $BRUTE -eq 1 ]] && line+=" Anonymous root login testing."
+                ;;
+            rdp)
+                line="RDP (port ${ports}, ${n} host(s)): Nmap encryption and NTLM info enumeration, BlueKeep (CVE-2019-0708) vulnerability check."
+                ;;
+            postgres)
+                line="PostgreSQL (port ${ports}, ${n} host(s)): Nmap version detection."
+                [[ $BRUTE -eq 1 ]] && line+=" Default postgres credential testing."
+                ;;
+            vnc)
+                line="VNC (port ${ports}, ${n} host(s)): Nmap version detection, VNC info enumeration."
+                [[ $BRUTE -eq 1 ]] && line+=" Default credential brute-force with Hydra."
+                ;;
+            winrm)
+                line="WinRM (port ${ports}, ${n} host(s)): Nmap version detection."
+                ;;
+            redis)
+                line="Redis (port ${ports}, ${n} host(s)): Unauthenticated access testing (PING, INFO, KEYS enumeration)."
+                ;;
+            memcached)
+                line="Memcached (port ${ports}, ${n} host(s)): Unauthenticated stats and items enumeration via Netcat."
+                ;;
+            mongodb)
+                line="MongoDB (port ${ports}, ${n} host(s)): Nmap mongodb-info scan, unauthenticated database listing attempted."
+                ;;
+            *)
+                line="${svc_key} (port ${ports}, ${n} host(s)): Version detection and banner grab."
+                ;;
+        esac
+        echo "- ${line}"
+    done
+
+    # Results summary (only when -o points to a completed run)
+    if [[ $HAS_RESULTS -eq 1 ]]; then
+        echo ""
+        echo "A total of ${nar_total} automated checks were executed: ${nar_ok} completed successfully, ${nar_fail} failed or timed out, and ${nar_skip} were skipped due to missing tools."
+
+        if [[ -n "$nar_missing" ]]; then
+            echo "The following tools were not available on the testing system and their associated checks were skipped: ${nar_missing}."
+        fi
+
+        if [[ -n "$nar_interesting" ]]; then
+            echo ""
+            echo "Notable findings requiring manual follow-up:"
+            echo ""
+            while IFS='|' read -r _status _host _port _svc _task _summary; do
+                echo "- ${_host}:${_port}/${_svc} — ${_task}: ${_summary}"
+            done <<< "$nar_interesting"
+        else
+            echo "No critical findings (anonymous access, default credentials, known vulnerabilities) were identified during automated testing."
+        fi
+    fi
+
+    echo ""
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Task runner with parallelism + timeout
