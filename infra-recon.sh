@@ -874,7 +874,11 @@ parse_nmap() {
     ' "$1"
 }
 
-declare -A HOST_PORTS=()  # host -> "port:service ..."
+# Delimiters for HOST_PORTS — nmap product/version can contain spaces and colons
+RS=$'\x01'  # record separator between entries
+FS=$'\x02'  # field separator within an entry
+
+declare -A HOST_PORTS=()  # host -> RS-separated records, FS-separated fields
 declare -A HOST_NAMES=()  # host -> hostname
 declare -A HOSTS_UP=()    # all hosts with state="up" (incl. -Pn)
 HOST_COUNT=0
@@ -898,7 +902,7 @@ while IFS='|' read -r addr hostname port proto svc product version; do
         echo ",$PORT_FILTER," | grep -q ",$port," || continue
     fi
 
-    HOST_PORTS["$addr"]+="$port:$svc:$product:$version "
+    HOST_PORTS["$addr"]+="${port}${FS}${svc}${FS}${product}${FS}${version}${RS}"
     HOST_COUNT=1
 done < <(parse_nmap "$NMAP_FILE")
 
@@ -942,14 +946,8 @@ if [[ $LIST_ONLY -eq 1 ]]; then
 
         hosts_with_ports=$((hosts_with_ports + 1))
         first=1
-        for entry in $(echo "${HOST_PORTS[$host]}" | tr ' ' '\n' | sort -t: -k1,1n); do
-            port="${entry%%:*}"
-            rest="${entry#*:}"
-            svc="${rest%%:*}"
-            rest2="${rest#*:}"
-            product="${rest2%%:*}"
-            version="${rest2#*:}"
-            version="${version% }"
+        while IFS="$FS" read -r port svc product version; do
+            [[ -z "$port" ]] && continue
             prod_ver=""
             [[ -n "$product" ]] && prod_ver="$product"
             [[ -n "$version" ]] && prod_ver="$prod_ver $version"
@@ -963,7 +961,7 @@ if [[ $LIST_ONLY -eq 1 ]]; then
                 printf "%-18s %-30s %-8s %-6s %-20s %s\n" \
                     "" "" "$port" "tcp" "$svc" "$prod_ver"
             fi
-        done
+        done < <(echo "${HOST_PORTS[$host]}" | tr "$RS" '\n' | sort -t"$FS" -k1,1n)
     done
 
     echo ""
@@ -1541,17 +1539,14 @@ EOF
 
     for host in $(echo "${!HOST_PORTS[@]}" | tr ' ' '\n' | sort); do
         local hn="${HOST_NAMES[$host]:-}"
-        local ports_raw="${HOST_PORTS[$host]}"
         local port_nums="" svcs=""
-        for entry in $ports_raw; do
-            local p="${entry%%:*}"
-            local rest="${entry#*:}"
-            local s="${rest%%:*}"
+        while IFS="$FS" read -r p s _product _version; do
+            [[ -z "$p" ]] && continue
             local svc_key
             svc_key=$(classify_port "$p" "$s")
             port_nums+="$p, "
             [[ -n "$svc_key" ]] && svcs+="${p}/${svc_key}, "
-        done
+        done < <(echo "${HOST_PORTS[$host]}" | tr "$RS" '\n')
         port_nums="${port_nums%, }"
         svcs="${svcs%, }"
         echo "| $host | $hn | $port_nums | $svcs |" >> "$report"
@@ -1622,21 +1617,19 @@ echo ""
 
 total_ports=0
 for host in $(echo "${!HOST_PORTS[@]}" | tr ' ' '\n' | sort); do
-    count=$(echo "${HOST_PORTS[$host]}" | wc -w)
+    count=$(echo "${HOST_PORTS[$host]}" | tr -cd "$RS" | wc -c)
     total_ports=$((total_ports + count))
 done
 log "Targets: ${#HOST_PORTS[@]} host(s), $total_ports open port(s)"
 
 declare -A SVC_COUNTS
 for host in "${!HOST_PORTS[@]}"; do
-    for entry in ${HOST_PORTS[$host]}; do
-        local_port="${entry%%:*}"
-        local_rest="${entry#*:}"
-        local_svc="${local_rest%%:*}"
+    while IFS="$FS" read -r local_port local_svc _product _version; do
+        [[ -z "$local_port" ]] && continue
         svc_key=$(classify_port "$local_port" "$local_svc")
         [[ -z "$svc_key" ]] && svc_key="unknown"
         SVC_COUNTS["$svc_key"]=$(( ${SVC_COUNTS["$svc_key"]:-0} + 1 ))
-    done
+    done < <(echo "${HOST_PORTS[$host]}" | tr "$RS" '\n')
 done
 breakdown=""
 for key in $(echo "${!SVC_COUNTS[@]}" | tr ' ' '\n' | sort); do
@@ -1649,15 +1642,13 @@ for host in $(echo "${!HOST_PORTS[@]}" | tr ' ' '\n' | sort); do
     hn="${HOST_NAMES[$host]:-}"
     label="$host"
     [[ -n "$hn" ]] && label="$host ($hn)"
-    port_count=$(echo "${HOST_PORTS[$host]}" | wc -w)
+    port_count=$(echo "${HOST_PORTS[$host]}" | tr -cd "$RS" | wc -c)
 
     log "Starting recon on $label — $port_count open port(s)"
 
     seen_services=""
-    for entry in ${HOST_PORTS[$host]}; do
-        port="${entry%%:*}"
-        rest="${entry#*:}"
-        svc_name="${rest%%:*}"
+    while IFS="$FS" read -r port svc_name _product _version; do
+        [[ -z "$port" ]] && continue
         svc_key=$(classify_port "$port" "$svc_name")
 
         if [[ -z "$svc_key" ]]; then
@@ -1673,7 +1664,7 @@ for host in $(echo "${!HOST_PORTS[@]}" | tr ' ' '\n' | sort); do
         mkdir -p "$svc_dir"
 
         dispatch_service "$svc_key" "$host" "$port" "$svc_dir"
-    done
+    done < <(echo "${HOST_PORTS[$host]}" | tr "$RS" '\n')
 done
 
 log "All tasks dispatched, waiting for completion..."
