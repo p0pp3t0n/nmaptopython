@@ -42,6 +42,7 @@ Required (unless -C, -S, or -K):
 
 Modes:
   -C            Tool check — list all tools and their install status, then exit
+  -L            List — print a host/port summary table and exit (no recon)
   -D            Deep mode — slow tools: nikto, nuclei, feroxbuster, testssl, enum4linux-ng
   -B            Brute mode — default-credential checks (hydra, netexec)
   -S DIR        Status — show running tasks with elapsed time
@@ -58,6 +59,8 @@ Options:
 Examples:
   infra-recon.sh -C                              # check tools
   infra-recon.sh -C -D -B                        # check all tools including deep + brute
+  infra-recon.sh -n full_tcp.xml -L              # just list hosts and open ports
+  infra-recon.sh -n full_tcp.xml -L -H 10.0.0.5  # list, filtered to one host
   infra-recon.sh -n full_tcp.xml -o ./recon
   infra-recon.sh -n full_tcp.xml -o ./recon -D -B -d corp.local
   infra-recon.sh -n full_tcp.xml -o ./recon -P 80,443,445 -H 10.0.0.5
@@ -751,15 +754,16 @@ check_tools() {
 # Defaults
 # ---------------------------------------------------------------------------
 NMAP_FILE="" OUTDIR="" DEEP=0 BRUTE=0 DOMAIN="" HOST_FILTER="" PORT_FILTER=""
-CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0 STATUS_DIR="" KILL_PID=""
+CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0 LIST_ONLY=0 STATUS_DIR="" KILL_PID=""
 
-while getopts "n:o:DBCd:H:P:t:T:S:K:h" opt; do
+while getopts "n:o:DBCLd:H:P:t:T:S:K:h" opt; do
     case $opt in
         n) NMAP_FILE="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
         D) DEEP=1 ;;
         B) BRUTE=1 ;;
         C) CHECK_ONLY=1 ;;
+        L) LIST_ONLY=1 ;;
         d) DOMAIN="$OPTARG" ;;
         H) HOST_FILTER="$OPTARG" ;;
         P) PORT_FILTER="$OPTARG" ;;
@@ -792,21 +796,26 @@ fi
 
 [[ -z "$NMAP_FILE" ]] && usage
 [[ ! -f "$NMAP_FILE" ]] && { err "File not found: $NMAP_FILE"; exit 1; }
-[[ -z "$OUTDIR" ]] && OUTDIR="recon_$(date +%Y%m%d_%H%M%S)"
 
-mkdir -p "$OUTDIR"
-extract_wordlists
+# List mode (-L) skips output dir, wordlists, and recon — just parse and print
+if [[ $LIST_ONLY -eq 0 ]]; then
+    [[ -z "$OUTDIR" ]] && OUTDIR="recon_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$OUTDIR"
+    extract_wordlists
+fi
 
-# Initialize log file
-LOG_FILE="$OUTDIR/infra-recon.log"
-{
-    echo "================================================================"
-    echo "infra-recon.sh — $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "Command: $0 $ORIGINAL_ARGS"
-    echo "Working directory: $(pwd)"
-    echo "================================================================"
-    echo ""
-} > "$LOG_FILE"
+# Initialize log file (skip in list-only mode)
+if [[ $LIST_ONLY -eq 0 ]]; then
+    LOG_FILE="$OUTDIR/infra-recon.log"
+    {
+        echo "================================================================"
+        echo "infra-recon.sh — $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Command: $0 $ORIGINAL_ARGS"
+        echo "Working directory: $(pwd)"
+        echo "================================================================"
+        echo ""
+    } > "$LOG_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 # Parse nmap XML — pure awk, no external deps
@@ -823,8 +832,7 @@ parse_nmap() {
         return substr(line, s, e - 1)
     }
 
-    /<host[> ]/ { in_host=1; addr=""; hostname=""; host_up=0 }
-    /<\/host>/ { in_host=0 }
+    /<host[> ]/ { in_host=1; addr=""; hostname=""; host_up=0; emitted=0 }
 
     in_host && /status.*state="up"/ { host_up=1 }
 
@@ -853,34 +861,117 @@ parse_nmap() {
     in_host && /<\/port>/ {
         if (host_up && port_open && addr != "" && portid != "") {
             print addr "|" hostname "|" portid "|" proto "|" svc_name "|" svc_product "|" svc_version
+            emitted = 1
         }
+    }
+
+    /<\/host>/ {
+        if (in_host && host_up && addr != "" && !emitted) {
+            print addr "|" hostname "|||||(no open ports)"
+        }
+        in_host=0
     }
     ' "$1"
 }
 
 declare -A HOST_PORTS=()  # host -> "port:service ..."
 declare -A HOST_NAMES=()  # host -> hostname
+declare -A HOSTS_UP=()    # all hosts with state="up" (incl. -Pn)
 HOST_COUNT=0
 
 while IFS='|' read -r addr hostname port proto svc product version; do
-    [[ -z "$addr" || -z "$port" ]] && continue
+    [[ -z "$addr" ]] && continue
 
-    # Apply filters
+    # Apply host filter
     if [[ -n "$HOST_FILTER" ]]; then
         echo ",$HOST_FILTER," | grep -q ",$addr," || continue
     fi
+
+    [[ -n "$hostname" ]] && HOST_NAMES["$addr"]="$hostname"
+    HOSTS_UP["$addr"]=1
+
+    # Sentinel line from parse_nmap (host up, no open ports)
+    [[ -z "$port" ]] && continue
+
+    # Apply port filter
     if [[ -n "$PORT_FILTER" ]]; then
         echo ",$PORT_FILTER," | grep -q ",$port," || continue
     fi
 
     HOST_PORTS["$addr"]+="$port:$svc:$product:$version "
-    [[ -n "$hostname" ]] && HOST_NAMES["$addr"]="$hostname"
     HOST_COUNT=1
 done < <(parse_nmap "$NMAP_FILE")
 
-if [[ $HOST_COUNT -eq 0 ]]; then
-    err "No hosts with open ports found (after filters)."
+if [[ ${#HOSTS_UP[@]} -eq 0 ]]; then
+    err "No live hosts found in $NMAP_FILE (after filters)."
     exit 1
+fi
+
+if [[ $HOST_COUNT -eq 0 && $LIST_ONLY -eq 0 ]]; then
+    err "No open ports found across ${#HOSTS_UP[@]} live host(s) — nothing to recon."
+    err "Use -L to see the host list anyway."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# List mode — print host/port summary and exit
+# ---------------------------------------------------------------------------
+if [[ $LIST_ONLY -eq 1 ]]; then
+    total_open=0
+    hosts_with_ports=0
+    hosts_no_ports=0
+
+    echo ""
+    echo -e "${BOLD}=== Infrastructure Host / Port Summary ===${NC}"
+    echo -e "${BOLD}Source:${NC} $NMAP_FILE"
+    echo ""
+
+    printf "${BOLD}%-18s %-30s %-8s %-6s %-20s %s${NC}\n" \
+        "HOST" "HOSTNAME" "PORT" "PROTO" "SERVICE" "PRODUCT / VERSION"
+    printf '%.0s─' {1..110}; echo ""
+
+    for host in $(echo "${!HOSTS_UP[@]}" | tr ' ' '\n' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n); do
+        hn="${HOST_NAMES[$host]:-—}"
+
+        if [[ -z "${HOST_PORTS[$host]:-}" ]]; then
+            printf "%-18s %-30s ${YELLOW}%-8s${NC} %-6s %-20s %s\n" \
+                "$host" "$hn" "—" "—" "—" "(no open ports)"
+            hosts_no_ports=$((hosts_no_ports + 1))
+            continue
+        fi
+
+        hosts_with_ports=$((hosts_with_ports + 1))
+        first=1
+        for entry in $(echo "${HOST_PORTS[$host]}" | tr ' ' '\n' | sort -t: -k1,1n); do
+            port="${entry%%:*}"
+            rest="${entry#*:}"
+            svc="${rest%%:*}"
+            rest2="${rest#*:}"
+            product="${rest2%%:*}"
+            version="${rest2#*:}"
+            version="${version% }"
+            prod_ver=""
+            [[ -n "$product" ]] && prod_ver="$product"
+            [[ -n "$version" ]] && prod_ver="$prod_ver $version"
+            total_open=$((total_open + 1))
+
+            if [[ $first -eq 1 ]]; then
+                printf "%-18s %-30s %-8s %-6s %-20s %s\n" \
+                    "$host" "$hn" "$port" "tcp" "$svc" "$prod_ver"
+                first=0
+            else
+                printf "%-18s %-30s %-8s %-6s %-20s %s\n" \
+                    "" "" "$port" "tcp" "$svc" "$prod_ver"
+            fi
+        done
+    done
+
+    echo ""
+    echo -e "${BOLD}Total:${NC} ${#HOSTS_UP[@]} host(s) up, $total_open open port(s)"
+    if [[ $hosts_no_ports -gt 0 ]]; then
+        warn "$hosts_no_ports host(s) up with no open ports (may be filtered or -Pn with no response)"
+    fi
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
