@@ -1123,8 +1123,15 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
         nar_interesting=$(cat "${NAR_RESULT_FILES[@]}" | grep '^OK|' | grep -iE 'anonymous|vulnerable|open relay|no auth|PONG|cipher.0|no_root_squash|Pwn3d|guest|null session|signing not required|listdatabases|200 \.env|200 \.git' || true)
     fi
 
+    # --- Determine output file ---
+    if [[ -n "${OUTDIRS[0]:-}" ]]; then
+        NAR_FILE="${OUTDIRS[0]}/testing_narrative.md"
+    else
+        NAR_FILE="testing_narrative.md"
+    fi
+
     # --- Build the narrative ---
-    echo ""
+    {
     echo "## Testing Narrative"
     echo ""
 
@@ -1278,6 +1285,9 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
     fi
 
     echo ""
+    } > "$NAR_FILE"
+
+    ok "Testing narrative written to $NAR_FILE"
     exit 0
 fi
 
