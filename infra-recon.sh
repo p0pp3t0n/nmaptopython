@@ -1125,11 +1125,7 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
 
     # --- Determine output file ---
     if [[ -n "${OUTDIRS[0]:-}" ]]; then
-        if [[ ! -d "${OUTDIRS[0]}" ]]; then
-            err "Output directory not found: ${OUTDIRS[0]}"
-            err "Run recon first, or omit -o to write to the current directory."
-            exit 1
-        fi
+        mkdir -p "${OUTDIRS[0]}"
         NAR_FILE="${OUTDIRS[0]}/testing_narrative.md"
     else
         NAR_FILE="testing_narrative.md"
