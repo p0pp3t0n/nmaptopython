@@ -32,7 +32,7 @@ err()  { echo -e "${RED}[-]${NC} $*";    _log_to_file "[-] $*"; }
 
 usage() {
     cat <<'EOF'
-Usage: infra-recon.sh -n <nmap.xml> [-o output_dir] [options]
+Usage: infra-recon.sh -n <nmap.xml> [-o output_dir] [options] [extra.xml ...]
        infra-recon.sh -C [-D] [-B]
        infra-recon.sh -S <output_dir>
        infra-recon.sh -K <PID> <output_dir>
@@ -64,8 +64,8 @@ Examples:
   infra-recon.sh -n full_tcp.xml -L -H 10.0.0.5  # list, filtered to one host
   infra-recon.sh -n full_tcp.xml -N              # generate testing narrative
   infra-recon.sh -n full_tcp.xml -N -D -B        # narrative reflecting deep+brute
-  infra-recon.sh -n tcp.xml -n udp.xml -N        # narrative from multiple scans
-  infra-recon.sh -n tcp.xml -N -o run1 -o run2   # narrative with merged results
+  infra-recon.sh -N -o run1 ../scans/*.xml        # narrative from all scans (wildcard)
+  infra-recon.sh -N -o run1 -o run2 *.xml         # narrative with merged results
   infra-recon.sh -n full_tcp.xml -o ./recon
   infra-recon.sh -n full_tcp.xml -o ./recon -D -B -d corp.local
   infra-recon.sh -n full_tcp.xml -o ./recon -P 80,443,445 -H 10.0.0.5
@@ -780,6 +780,10 @@ while getopts "n:o:DBCLNd:H:P:t:T:S:K:h" opt; do
         h|*) usage ;;
     esac
 done
+shift $((OPTIND - 1))
+
+# Remaining positional args are extra nmap files (supports wildcards)
+NMAP_FILES+=("$@")
 
 # Compat: single-value aliases used by recon mode and downstream code
 NMAP_FILE="${NMAP_FILES[0]:-}"
