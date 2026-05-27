@@ -1121,6 +1121,53 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
         nar_total=$((nar_ok + nar_fail + nar_skip))
         nar_missing=$(cat "${NAR_RESULT_FILES[@]}" | grep '^SKIP|' | sed 's/.*tool not found: //' | sort -u | paste -sd',' | sed 's/,/, /g' || true)
         nar_interesting=$(cat "${NAR_RESULT_FILES[@]}" | grep '^OK|' | grep -iE 'anonymous|vulnerable|open relay|no auth|PONG|cipher.0|no_root_squash|Pwn3d|guest|null session|signing not required|listdatabases|200 \.env|200 \.git' || true)
+
+        # Extract actual tool names from task column (OK and FAIL = ran, SKIP = didn't)
+        nar_tools=$(cat "${NAR_RESULT_FILES[@]}" | grep -E '^(OK|FAIL)\|' | cut -d'|' -f5 | sed '
+            s/^nmap-.*/nmap/
+            s/^smb-.*/netexec/
+            s/^ftp-anon$/netexec/
+            s/^ftp-default-creds$/hydra/
+            s/^ssh-default-creds$/hydra/
+            s/^pop3-brute$/hydra/
+            s/^imap-brute$/hydra/
+            s/^vnc-brute$/hydra/
+            s/^mssql-default-sa$/netexec/
+            s/^mysql-anon-root$/mysql/
+            s/^pg-default$/psql/
+            s/^ms17-010$/nmap/
+            s/^smbghost$/nmap/
+            s/^bluekeep$/nmap/
+            s/^ssl-scan$/sslscan/
+            s/^ssl-cert$/openssl/
+            s/^ldaps-cert$/openssl/
+            s/^http-headers$/curl/
+            s/^http-methods$/nmap/
+            s/^robots-txt$/curl/
+            s/^sitemap-xml$/curl/
+            s/^sensitive-files$/curl/
+            s/^banner-grab$/netcat/
+            s/^cipher-zero$/ipmitool/
+            s/^ipmi-.*$/ipmitool/
+            s/^community-brute$/onesixtyone/
+            s/^snmpwalk-public$/snmpwalk/
+            s/^dns-version$/dig/
+            s/^dns-cache-snoop$/nmap/
+            s/^dns-enum$/dnsrecon/
+            s/^reverse-dns$/dnsrecon/
+            s/^zone-transfer$/dig/
+            s/^kerbrute-enum$/kerbrute/
+            s/^odat-sid$/odat/
+            s/^ldap-rootdse$/nmap/
+            s/^ldap-anon.*$/ldapsearch/
+            s/^smtp-open-relay$/nmap/
+            s/^smtp-ntlm-info$/nmap/
+            s/^smtp-user-enum$/smtp-user-enum/
+            s/^imap-ntlm-info$/nmap/
+            s/^redis-.*$/redis-cli/
+            s/^memcached-.*$/netcat/
+            s/^mongodb-noauth$/mongosh/
+        ' | sort -u | paste -sd',' | sed 's/,/, /g' || true)
     fi
 
     # --- Determine output file ---
@@ -1267,6 +1314,9 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
     # Results summary (only when -o points to a completed run)
     if [[ $HAS_RESULTS -eq 1 ]]; then
         echo ""
+        if [[ -n "$nar_tools" ]]; then
+            echo "Tools employed during testing: ${nar_tools}."
+        fi
         echo "A total of ${nar_total} automated checks were executed: ${nar_ok} completed successfully, ${nar_fail} failed or timed out, and ${nar_skip} were skipped due to missing tools."
 
         if [[ -n "$nar_missing" ]]; then
