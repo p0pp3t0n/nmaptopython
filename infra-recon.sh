@@ -38,7 +38,7 @@ Usage: infra-recon.sh -n <nmap.xml> [-o output_dir] [options]
        infra-recon.sh -K <PID> <output_dir>
 
 Required (unless -C, -S, or -K):
-  -n FILE       Nmap XML (-oX) file
+  -n FILE       Nmap XML (-oX) file (repeat for multiple: -n a.xml -n b.xml)
 
 Modes:
   -C            Tool check — list all tools and their install status, then exit
@@ -64,6 +64,8 @@ Examples:
   infra-recon.sh -n full_tcp.xml -L -H 10.0.0.5  # list, filtered to one host
   infra-recon.sh -n full_tcp.xml -N              # generate testing narrative
   infra-recon.sh -n full_tcp.xml -N -D -B        # narrative reflecting deep+brute
+  infra-recon.sh -n tcp.xml -n udp.xml -N        # narrative from multiple scans
+  infra-recon.sh -n tcp.xml -N -o run1 -o run2   # narrative with merged results
   infra-recon.sh -n full_tcp.xml -o ./recon
   infra-recon.sh -n full_tcp.xml -o ./recon -D -B -d corp.local
   infra-recon.sh -n full_tcp.xml -o ./recon -P 80,443,445 -H 10.0.0.5
@@ -756,13 +758,13 @@ check_tools() {
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-NMAP_FILE="" OUTDIR="" DEEP=0 BRUTE=0 DOMAIN="" HOST_FILTER="" PORT_FILTER=""
+NMAP_FILES=() OUTDIRS=() DEEP=0 BRUTE=0 DOMAIN="" HOST_FILTER="" PORT_FILTER=""
 CMD_TIMEOUT=300 MAX_PARALLEL=5 CHECK_ONLY=0 LIST_ONLY=0 NARRATIVE_ONLY=0 STATUS_DIR="" KILL_PID=""
 
 while getopts "n:o:DBCLNd:H:P:t:T:S:K:h" opt; do
     case $opt in
-        n) NMAP_FILE="$OPTARG" ;;
-        o) OUTDIR="$OPTARG" ;;
+        n) NMAP_FILES+=("$OPTARG") ;;
+        o) OUTDIRS+=("$OPTARG") ;;
         D) DEEP=1 ;;
         B) BRUTE=1 ;;
         C) CHECK_ONLY=1 ;;
@@ -778,6 +780,10 @@ while getopts "n:o:DBCLNd:H:P:t:T:S:K:h" opt; do
         h|*) usage ;;
     esac
 done
+
+# Compat: single-value aliases used by recon mode and downstream code
+NMAP_FILE="${NMAP_FILES[0]:-}"
+OUTDIR="${OUTDIRS[0]:-}"
 
 # Kill mode
 if [[ -n "$KILL_PID" ]]; then
@@ -798,11 +804,16 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
     exit $?
 fi
 
-[[ -z "$NMAP_FILE" ]] && usage
-[[ ! -f "$NMAP_FILE" ]] && { err "File not found: $NMAP_FILE"; exit 1; }
+[[ ${#NMAP_FILES[@]} -eq 0 ]] && usage
 
-# List/narrative modes skip creating output dir and extracting wordlists
+# Validate all nmap files exist
+for _nf in "${NMAP_FILES[@]}"; do
+    [[ ! -f "$_nf" ]] && { err "File not found: $_nf"; exit 1; }
+done
+
+# Recon mode requires exactly one nmap file and one output dir
 if [[ $LIST_ONLY -eq 0 && $NARRATIVE_ONLY -eq 0 ]]; then
+    [[ ${#NMAP_FILES[@]} -gt 1 ]] && { err "Recon mode only supports a single -n file. Use -L or -N for multiple."; exit 1; }
     [[ -z "$OUTDIR" ]] && OUTDIR="recon_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$OUTDIR"
     extract_wordlists
@@ -908,10 +919,10 @@ while IFS='|' read -r addr hostname port proto svc product version; do
 
     HOST_PORTS["$addr"]+="${port}${FS}${svc}${FS}${product}${FS}${version}${RS}"
     HOST_COUNT=1
-done < <(parse_nmap "$NMAP_FILE")
+done < <(for _nf in "${NMAP_FILES[@]}"; do parse_nmap "$_nf"; done)
 
 if [[ ${#HOSTS_UP[@]} -eq 0 ]]; then
-    err "No live hosts found in $NMAP_FILE (after filters)."
+    err "No live hosts found across ${#NMAP_FILES[@]} nmap file(s) (after filters)."
     exit 1
 fi
 
@@ -931,7 +942,7 @@ if [[ $LIST_ONLY -eq 1 ]]; then
 
     echo ""
     echo -e "${BOLD}=== Infrastructure Host / Port Summary ===${NC}"
-    echo -e "${BOLD}Source:${NC} $NMAP_FILE"
+    echo -e "${BOLD}Source:${NC} ${NMAP_FILES[*]}"
     echo ""
 
     printf "${BOLD}%-18s %-30s %-8s %-6s %-20s %s${NC}\n" \
@@ -1053,11 +1064,16 @@ classify_port() {
 # Narrative mode — generate testing narrative for reports and exit
 # ---------------------------------------------------------------------------
 if [[ $NARRATIVE_ONLY -eq 1 ]]; then
-    # Check if we have results from a completed run
+    # Collect results.csv from completed runs (one or more -o dirs)
     HAS_RESULTS=0
-    if [[ -n "${OUTDIR:-}" && -f "$OUTDIR/results.csv" ]]; then
+    NAR_RESULT_FILES=()
+    for _od in "${OUTDIRS[@]}"; do
+        if [[ -f "$_od/results.csv" ]]; then
+            NAR_RESULT_FILES+=("$_od/results.csv")
+        fi
+    done
+    if [[ ${#NAR_RESULT_FILES[@]} -gt 0 ]]; then
         HAS_RESULTS=1
-        NAR_RESULTS="$OUTDIR/results.csv"
     fi
 
     # Collect unique service categories across all hosts
@@ -1097,14 +1113,14 @@ if [[ $NARRATIVE_ONLY -eq 1 ]]; then
     [[ $DEEP -eq 1 ]] && mode_desc="deep"
     [[ $BRUTE -eq 1 ]] && mode_desc="$mode_desc with default-credential testing"
 
-    # If we have results, pull stats
+    # If we have results, pull stats (merge across all result files)
     if [[ $HAS_RESULTS -eq 1 ]]; then
-        nar_ok=$(grep -c '^OK|' "$NAR_RESULTS" 2>/dev/null || echo "0")
-        nar_fail=$(grep -c '^FAIL|' "$NAR_RESULTS" 2>/dev/null || echo "0")
-        nar_skip=$(grep -c '^SKIP|' "$NAR_RESULTS" 2>/dev/null || echo "0")
+        nar_ok=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^OK|' 2>/dev/null || echo "0")
+        nar_fail=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^FAIL|' 2>/dev/null || echo "0")
+        nar_skip=$(cat "${NAR_RESULT_FILES[@]}" | grep -c '^SKIP|' 2>/dev/null || echo "0")
         nar_total=$((nar_ok + nar_fail + nar_skip))
-        nar_missing=$(grep '^SKIP|' "$NAR_RESULTS" | sed 's/.*tool not found: //' | sort -u | paste -sd',' | sed 's/,/, /g' || true)
-        nar_interesting=$(grep '^OK|' "$NAR_RESULTS" | grep -iE 'anonymous|vulnerable|open relay|no auth|PONG|cipher.0|no_root_squash|Pwn3d|guest|null session|signing not required|listdatabases|200 \.env|200 \.git' || true)
+        nar_missing=$(cat "${NAR_RESULT_FILES[@]}" | grep '^SKIP|' | sed 's/.*tool not found: //' | sort -u | paste -sd',' | sed 's/,/, /g' || true)
+        nar_interesting=$(cat "${NAR_RESULT_FILES[@]}" | grep '^OK|' | grep -iE 'anonymous|vulnerable|open relay|no auth|PONG|cipher.0|no_root_squash|Pwn3d|guest|null session|signing not required|listdatabases|200 \.env|200 \.git' || true)
     fi
 
     # --- Build the narrative ---
